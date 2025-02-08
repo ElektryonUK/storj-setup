@@ -1,78 +1,91 @@
 #!/bin/bash
 
-# WireGuard configuration
-VPN_INTERFACE="wg0"
-VPN_IP_HOME="10.0.0.2"
-VPN_IP_VPS="10.0.0.1"
-TABLE_ID=200
-VPN_PORT=51820
+# This script sets up a WireGuard VPN and configures selective traffic routing.
+# It can be used to route only specific ports (e.g., Storj node traffic) through a VPS.
 
-echo "This script will set up a WireGuard VPN and route only selected ports through it."
+# Configuration Variables
+VPN_INTERFACE="wg0"          # Name of the WireGuard interface
+VPN_IP_HOME="10.0.0.2"       # Private VPN IP for the home server
+VPN_IP_VPS="10.0.0.1"        # Private VPN IP for the VPS
+TABLE_ID=200                 # Custom routing table ID for selective traffic
+VPN_PORT=51820               # WireGuard VPN listening port on the VPS
 
-# Ask if this is the VPS or the Home Server
-echo "Are you running this on the VPS or Home Server? (Enter 'vps' or 'home')"
+echo "This script will set up a WireGuard VPN and configure selective port routing."
+
+# Ask if this setup is for the VPS or the Home Server
+echo "Are you setting up this script on the VPS or Home Server? (Enter 'vps' or 'home')"
 read SERVER_TYPE
 
+# Validate input
 if [[ "$SERVER_TYPE" != "vps" && "$SERVER_TYPE" != "home" ]]; then
     echo "Invalid input. Please enter 'vps' or 'home'."
     exit 1
 fi
 
-# Install WireGuard
-echo "Installing WireGuard..."
+# Install required packages (WireGuard and iptables-persistent for firewall rules)
+echo "Installing required packages..."
 sudo apt update && sudo apt install -y wireguard iptables-persistent
 
-# Generate WireGuard Keys
+# Generate WireGuard private and public keys
 PRIVATE_KEY=$(wg genkey)
 PUBLIC_KEY=$(echo "$PRIVATE_KEY" | wg pubkey)
 
+# VPS Configuration
 if [[ "$SERVER_TYPE" == "vps" ]]; then
     echo "Setting up WireGuard on the VPS..."
 
-    # Save Private Key
+    # Save the private key securely
     echo "$PRIVATE_KEY" > /etc/wireguard/privatekey
     chmod 600 /etc/wireguard/privatekey
 
-    # Create WireGuard Config
+    # Create WireGuard configuration file for the VPS
     cat > /etc/wireguard/$VPN_INTERFACE.conf <<EOF
 [Interface]
 PrivateKey = $(cat /etc/wireguard/privatekey)
 Address = $VPN_IP_VPS/24
 ListenPort = $VPN_PORT
+
+# NAT to allow forwarding traffic to the internet
 PostUp = iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
 PostDown = iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
 
 [Peer]
-PublicKey = <HOME_SERVER_PUBLIC_KEY>
+PublicKey = <HOME_SERVER_PUBLIC_KEY>  # Replace with the home server's public key
 AllowedIPs = $VPN_IP_HOME/32
 PersistentKeepalive = 25
 EOF
 
-    echo "WireGuard configuration completed. Share the following public key with your home server:"
-    echo "VPS Public Key: $PUBLIC_KEY"
-
+    # Start WireGuard and enable it to run at boot
     sudo systemctl enable wg-quick@$VPN_INTERFACE
     sudo systemctl start wg-quick@$VPN_INTERFACE
+
+    # Display the VPS public key to be shared with the home server
+    echo "WireGuard VPN setup is complete on the VPS."
+    echo "Share the following details with your home server:"
+    echo "VPS Public Key: $PUBLIC_KEY"
+    echo "VPS IP Address: $(curl -s ifconfig.me)"
+    echo "Private VPN IP (VPS): $VPN_IP_VPS"
+    echo "VPN Port: $VPN_PORT"
 
     exit 0
 fi
 
+# Home Server Configuration
 if [[ "$SERVER_TYPE" == "home" ]]; then
     echo "Setting up WireGuard on the Home Server..."
 
-    # Ask for VPS public key
+    # Ask for the VPS's public key and IP address
     echo "Enter the public key from the VPS:"
     read VPS_PUBLIC_KEY
 
-    # Ask for VPS IP
-    echo "Enter the VPS public IP:"
+    echo "Enter the public IP of the VPS:"
     read VPS_IP
 
-    # Save Private Key
+    # Save the private key securely
     echo "$PRIVATE_KEY" > /etc/wireguard/privatekey
     chmod 600 /etc/wireguard/privatekey
 
-    # Create WireGuard Config
+    # Create WireGuard configuration file for the Home Server
     cat > /etc/wireguard/$VPN_INTERFACE.conf <<EOF
 [Interface]
 PrivateKey = $(cat /etc/wireguard/privatekey)
@@ -85,41 +98,48 @@ AllowedIPs = 0.0.0.0/0
 PersistentKeepalive = 25
 EOF
 
+    # Start WireGuard and enable it to run at boot
     sudo systemctl enable wg-quick@$VPN_INTERFACE
     sudo systemctl start wg-quick@$VPN_INTERFACE
 
-    # Ask for the ports to route
+    # Ask for the ports to route through the VPN
     echo "Enter the ports you want to route through the VPN (separated by spaces, e.g., '28967 7777'):"
     read PORTS
 
-    # Set up routing rules
-    echo "Setting up routing rules..."
+    # Set up routing rules to ensure only selected traffic goes through the VPN
+    echo "Configuring routing rules..."
+
+    # Add a custom routing rule for VPN traffic
     ip rule add from $VPN_IP_HOME table $TABLE_ID
     ip route add default via $VPN_IP_VPS table $TABLE_ID
 
-    # Apply iptables rules for selected ports
+    # Use iptables to mark packets going to the selected ports
     for PORT in $PORTS; do
         iptables -t mangle -A OUTPUT -p tcp --dport $PORT -j MARK --set-mark 2
         iptables -t mangle -A OUTPUT -p udp --dport $PORT -j MARK --set-mark 2
     done
 
+    # Apply the marked packets to our custom routing table
     ip rule add fwmark 2 table $TABLE_ID
 
-    # Make settings persistent
-    echo "Making settings persistent..."
+    # Make the configuration persistent across reboots
+    echo "Saving configuration to persist after reboot..."
 
+    # Add custom routing table
     echo "200 storjvpn" >> /etc/iproute2/rt_tables
 
+    # Ensure that the routing rules are applied at boot
     cat >> /etc/network/interfaces <<EOF
 
-# Storj VPN Routing
+# Custom routing rules for Storj VPN
 post-up ip rule add from $VPN_IP_HOME table $TABLE_ID
 post-up ip route add default via $VPN_IP_VPS table $TABLE_ID
 EOF
 
+    # Save iptables rules persistently
     sudo iptables-save > /etc/iptables/rules.v4
 
-    echo "Setup complete! Your Storj traffic on ports ($PORTS) will now be routed through the VPS."
+    echo "Setup complete! The following ports ($PORTS) are now routed through the VPS VPN."
 
     exit 0
 fi
